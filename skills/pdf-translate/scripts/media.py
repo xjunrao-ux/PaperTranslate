@@ -15,8 +15,15 @@ def image_pdf(path):
     with Image.open(path) as original:
         for i in range(getattr(original,'n_frames',1)):
             original.seek(i)
-            image = ImageOps.exif_transpose(original.copy()).convert('RGB')
+            image = ImageOps.exif_transpose(original.copy())
+            if image.mode in ('RGBA','LA') or 'transparency' in image.info:
+                rgba=image.convert('RGBA')
+                paper=Image.new('RGBA',image.size,'white');paper.alpha_composite(rgba)
+                image=paper.convert('RGB')
+            else:
+                image=image.convert('RGB')
             dpi = original.info.get('dpi',(96,96))
+            if isinstance(dpi,(int,float)):dpi=(dpi,dpi)
             dpi = [float(x) if 36 <= float(x) <= 1200 else 96 for x in dpi]
             stream = io.BytesIO();image.save(stream,format='PNG')
             page = doc.new_page(width=image.width*72/dpi[0],height=image.height*72/dpi[1])
@@ -81,6 +88,17 @@ def background(page, bbox):
     if uniform<.94:
         raise ValueError('文字区域边缘含复杂背景，禁止自动覆盖，需人工缩小区域或采用图文对照。')
     return tuple(min(255,max(0,c))/255 for c in most)
+
+
+def foreground(page,bbox,bg):
+    pix=page.get_pixmap(clip=fitz.Rect(bbox),dpi=180,alpha=False)
+    pixels=zip(*[iter(pix.samples)]*3)
+    bg255=tuple(round(c*255) for c in bg)
+    contrasting=Counter(tuple(min(255,max(0,round(c/8)*8)) for c in p) for p in pixels
+                        if max(abs(a-b) for a,b in zip(p,bg255))>48)
+    if contrasting:
+        return tuple(c/255 for c in contrasting.most_common(1)[0][0])
+    return (0,0,0) if sum(bg)/3>.5 else (1,1,1)
 
 
 def extract_attachments(pdf_path, directory, max_bytes=100*1024*1024):

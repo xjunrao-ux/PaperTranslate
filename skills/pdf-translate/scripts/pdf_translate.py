@@ -11,21 +11,22 @@ from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 from pathlib import Path
 import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import typography
-import media
-
 try:
     import pymupdf as fitz
+    import typography
+    import media
 except ImportError:
     fitz = None
 
 VERSION = 1
+ENGINE_VERSION = '2.0.0'
 TOKEN = re.compile(r"⟦T\d{4}⟧")
 NUMBER = re.compile(r"(?<![\w])[-+−]?\d+(?:[.,]\d+)*(?:[eE][-+]?\d+)?")
 HAN = re.compile(r"[\u3400-\u9fff]")
@@ -83,9 +84,27 @@ def input_hash(block):
 
 
 def revision(job, doc, translations):
-    return digest([doc, translations, read_json(job / "decisions.json"),
+    return digest([ENGINE_VERSION,doc, translations, read_json(job / "decisions.json"),
                    read_json(job / "figures.json"),
-                   read_json(job / 'attachments.json') if (job / 'attachments.json').exists() else []])
+                   attachment_state(job)])
+
+
+def attachment_state(job):
+    if not (job/'attachments.json').exists(): return []
+    values=[]
+    for entry in read_json(job/'attachments.json'):
+        item=dict(entry)
+        if item.get('job'):
+            item['inputs']={n:file_hash(Path(item['job'])/n) for n in
+                            ('document.json','translations.json','decisions.json','figures.json','attachments.json')
+                            if (Path(item['job'])/n).is_file()}
+            qa_file=Path(item['job'])/'output/qa.json'
+            if qa_file.exists():
+                item['qa_sha256']=file_hash(qa_file)
+                qa=read_json(qa_file)
+                item['outputs']={p:file_hash(p) if Path(p).is_file() else None for p in qa.get('output_hashes',{})}
+        values.append(item)
+    return values
 
 
 def issue(code, message, block_id=None, page=None, severity="major", **extra):
@@ -152,6 +171,7 @@ def extract_page(page, number):
             if cell is not None and kind == "text":
                 kind = "table_cell"
             items.append(dict(bbox=list(box), source=text, kind=kind,
+                              rotation=90 if all(abs(l.get('dir',(1,0))[0])<.01 and l.get('dir',(1,0))[1]<-.9 for l in group) else 0,
                               cell_bbox=list(cell) if cell is not None else None,
                               suggested_action="keep" if automatic_keep else "translate",
                               spans=[dict(bbox=list(s["bbox"]), text=s["text"], font=s["font"],
@@ -212,6 +232,7 @@ def cmd_doctor(args):
     require_pdf()
     font = fitz.Font("china-s")
     result = dict(python=sys.version.split()[0], executable=sys.executable,
+                  engine=ENGINE_VERSION,local_ocr=bool(importlib.util.find_spec('rapidocr_onnxruntime')),
                   pymupdf=importlib.metadata.version("PyMuPDF"),
                   pinned="1.26.7", font=font.name, chinese=bool(font.has_glyph(ord("中"))),
                   network="none; translations supplied by calling assistant")
@@ -229,6 +250,8 @@ def cmd_prepare(args):
         if doc["original_sha256"] != original_hash:
             raise ValueError("此任务目录属于另一份文档；请选择新目录")
         print("已存在相同任务，保留译文和裁决：" + str(job))
+        if getattr(args,'ocr',False):
+            cmd_ocr(argparse.Namespace(job=str(job),scope='pages',regions=None))
         return
     if job.exists() and any(job.iterdir()):
         raise ValueError("新任务目录必须为空，避免覆盖文件")
@@ -469,6 +492,20 @@ def layout(text, rect, b, font, min_size):
 
 def collect_issues(job, doc, translations):
     issues, decisions = json.loads(json.dumps(doc["warnings"])), read_json(job / "decisions.json")
+    for i,item in enumerate(attachment_state(job),1):
+        if not item.get('supported'):
+            issues.append(issue(f'attachment-{i:03d}','未自动翻译附件：'+item['filename'],severity='minor'))
+        else:
+            child=Path(item['job']) if item.get('job') else None
+            qa_file=child/'output/qa.json' if child else None
+            complete=False
+            if qa_file and qa_file.exists():
+                qa=read_json(qa_file)
+                _,cd,ct=state(child)
+                complete=(qa.get('status')=='complete' and qa['revision']==revision(child,cd,ct) and
+                          all(Path(p).is_file() and file_hash(p)==h for p,h in qa['output_hashes'].items()))
+            if not complete:
+                issues.append(issue(f'attachment-{i:03d}','附件翻译尚未核验完成：'+item['filename']))
     for page in doc["pages"]:
         figures = read_json(job / "figures.json")
         for image in page["images"]:
@@ -548,11 +585,15 @@ def write_report(job, doc, translations, qa):
         entry = translations.get(b["id"], {})
         if entry.get("action") == "keep":
             lines.append(f"- {b['id']}：{entry['reason']}；原文：{b['source']}")
-    lines += ["", "## 位图文字补充翻译", "",
-              "以下译文位于本报告；原 PDF 图像保持不变，未在位图中抹除或替换标签。", ""]
+    lines += ["", "## 图像文字与补充译注", "",
+              "可提取图中文字和已核对的 OCR 区域随正文写入译文；本节记录额外图注。复杂背景不自动覆盖，未处理区域见问题清单。源图副本和数据图形保留。", ""]
     for key, figure in read_json(job / "figures.json").items():
         lines += [f"### {key}", "原文：" + figure.get("source", ""),
                   "译文：" + figure.get("translation", ""), "核对说明：" + figure["note"], ""]
+    if (job/'attachments.json').exists():
+        lines+=['## PDF 内嵌附件','']
+        for item in read_json(job/'attachments.json'):
+            lines.append(f"- {item['filename']}：{item['status']}；任务目录：{item.get('job','无')}")
     failed = {q.get("block_id") for q in qa["issues"] if not q.get("resolved")}
     lines += ["## 待排版译文（完整保留）", ""]
     for b in blocks(doc):
@@ -583,7 +624,7 @@ def cmd_render(args):
             if any(q["block_id"] == b["id"] and not q.get("resolved") and
                    q["id"].startswith(("numbers-", "language-",'format-')) for q in issues):
                 continue
-            if b["kind"] in ("math", "rotated"):
+            if b["kind"]=='math' or (b['kind']=='rotated' and b.get('rotation')!=90):
                 issues.append(issue("unsupported-" + b["id"],
                                     "混合数学/旋转内容需要人工处理；保留原区域以防损坏。",
                                     b["id"], b["page"]))
@@ -602,9 +643,12 @@ def cmd_render(args):
                 issues.append(issue("overlap-" + b["id"], "源文字区域与其他块重叠，需要人工拆分。",
                                     b["id"], b["page"]))
                 continue
-            rect = fitz.Rect(b['bbox']) if b.get('ocr') else available_rect(b, model, drawings)
+            rotated=b.get('rotation')==90
+            original_rect=fitz.Rect(b['bbox'])
+            rect = original_rect if b.get('ocr') else available_rect(b, model, drawings)
+            if rotated: rect=fitz.Rect(3,3,3+original_rect.height,3+original_rect.width)
             floor=min(args.min_font,b['font_size'])
-            formatted=any(any(s.values()) for s in character_styles)
+            formatted=rotated or any(any(s.values()) for s in character_styles)
             plan = (typography.rich_layout(target,character_styles,rect,b,font,floor,wrap_text)
                     if formatted else layout(target, rect, b, font, floor))
             if plan is None:
@@ -613,9 +657,12 @@ def cmd_render(args):
                 continue
             plan.update(block_id=b["id"], page=b["page"], source_bbox=b["bbox"], target=target,
                         anchor_error_pt=0.0,style_default=typography.default_style(b))
+            if rotated:
+                plan.update(rotation=90,rotation_bounds=list(original_rect))
             if b.get('ocr'):
                 try:
                     plan['erase_background']=media.background(page,b['bbox'])
+                    plan['ocr_foreground']=media.foreground(page,b['bbox'],plan['erase_background'])
                 except ValueError as exc:
                     issues.append(issue('image-background-'+b['id'],str(exc),b['id'],b['page']))
                     continue
@@ -640,7 +687,10 @@ def cmd_render(args):
             x0, y0, x1, y1 = plan["rect"]
             color_int = b["spans"][0]["color"]
             color = tuple(((color_int >> shift) & 255) / 255 for shift in (16, 8, 0))
-            if 'segments' in plan:
+            if b.get('ocr'):color=plan['ocr_foreground']
+            if plan.get('rotation')==90:
+                typography.draw_rotated(page,plan,font,color)
+            elif 'segments' in plan:
                 typography.draw(page,plan,font,color)
             else:
                 writer = fitz.TextWriter(page.rect)
@@ -655,6 +705,15 @@ def cmd_render(args):
     dual = output / f"bilingual{suffix}.pdf"
     translated.set_metadata(dict(title=doc["original_name"] + " 中文译文" + (" DRAFT" if blockers else ""),
                                  producer="pdf-translate v2 / PyMuPDF"))
+    translated_attachments=[]
+    if (job/'attachments.json').exists():
+        for i,item in enumerate(read_json(job/'attachments.json'),1):
+            if item.get('job') and not any(q['id']==f'attachment-{i:03d}' and not q.get('resolved') for q in issues):
+                child=read_json(Path(item['job'])/'output/qa.json')
+                path=Path(child['translated'])
+                name=f"translated-{i:03d}-{Path(item['filename']).stem}.pdf"
+                translated.embfile_add(name,path.read_bytes(),filename=name)
+                translated_attachments.append((name,path))
     translated.save(mono, garbage=4, deflate=True)
     bilingual, original = fitz.open(), fitz.open(job / "source.pdf")
     for i, page in enumerate(original):
@@ -667,6 +726,8 @@ def cmd_render(args):
                            fontsize=9, color=(0.25, 0.3, 0.4))
     bilingual.set_metadata(dict(title="English-Chinese" + (" DRAFT" if blockers else ""),
                                 producer="pdf-translate v2 / PyMuPDF"))
+    for name,path in translated_attachments:
+        bilingual.embfile_add(name,path.read_bytes(),filename=name)
     bilingual.save(dual, garbage=4, deflate=True)
     bilingual.close()
     original.close()
@@ -705,7 +766,7 @@ def cmd_decide(args):
     if args.issue not in available:
         raise ValueError("未知问题编号；仅可裁决语义/来源疑点，不能绕过排版错误。")
     q = available[args.issue]
-    if args.issue.startswith(("missing-", "stale-", "language-", "scan-",'format-','image-background-')):
+    if args.issue.startswith(("missing-", "stale-", "language-", "scan-",'format-','image-background-','attachment-')):
         raise ValueError("此问题须修复内容或重新导入，不能仅靠裁决跳过。")
     clean = {k: v for k, v in q.items() if k not in ("resolved", "decision")}
     decisions = read_json(job / "decisions.json")
@@ -724,7 +785,7 @@ def cmd_figure(args):
     data = read_json(job / "figures.json")
     data[args.id] = dict(source=args.source, translation=args.translation, note=args.note, time=now())
     write_json(job / "figures.json", data)
-    print("已记录图片检查/补充翻译；原图保持不变，重新 render 更新报告。")
+    print("已记录图片检查/补充翻译；重新 render 更新译文和报告，保留源图副本与图形数据。")
 
 
 def cmd_verify(args):

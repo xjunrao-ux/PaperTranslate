@@ -157,3 +157,21 @@ def draw(page, plan, font, color):
         if style['strike']:
             y = point.y - size*.30
             page.draw_line((point.x,y),(point.x+piece['advance'],y),color=color,width=max(.3,size*.045))
+
+
+def draw_rotated(page,plan,font,color):
+    bounds=fitz.Rect(plan['rotation_bounds'])
+    temp=fitz.open()
+    try:
+        p=temp.new_page(width=bounds.height+6,height=bounds.width+6)
+        draw(p,plan,font,color)
+        spans=[s for b in p.get_text('dict')['blocks'] if b.get('type')==0 for l in b['lines'] for s in l['spans']]
+        clip=fitz.Rect(spans[0]['bbox'])
+        for s in spans[1:]:clip|=fitz.Rect(s['bbox'])
+        target=fitz.Rect(bounds.x0,bounds.y0,bounds.x0+clip.height,bounds.y0+clip.width)
+        if target.x1>bounds.x1+.1 or target.y1>bounds.y1+.1:
+            raise ValueError('旋转文字超出原区域')
+        page.show_pdf_page(target,temp,0,clip=clip,rotate=90,keep_proportion=False)
+        plan['rect']=list(target)
+    finally:
+        temp.close()

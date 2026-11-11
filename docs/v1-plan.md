@@ -4,6 +4,8 @@
 
 实现更新（2026-11-07）：v1 已完成基于 PyMuPDF 的本地块处理与排版流程，翻译由调用 skill 的当前会话提供；本版不接入 BabelDOC 内部接口。当前实现、验证范围和限制见 [v1 实现记录](implementation-v1.md)，入口见 [SKILL.md](../skills/pdf-translate/SKILL.md)。下文候选引擎与待验证事项属于原规划，不代表全部已实现。
 
+实现更新（2026-11-11）：v2 加入原文粗斜体保留、图片/扫描件本地 OCR 和 PDF 附件翻译，详见 [v2 实现记录](implementation-v2.md)。
+
 ## 已确认需求
 
 | 项目 | 要求 |

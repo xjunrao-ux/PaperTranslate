@@ -69,7 +69,7 @@ python <tool> import <job> response-page-0001.json
 }
 ```
 
-带英文解释的公式段不能因为难排而直接保留并宣称译完。标注疑难，必要时以原块保留的草稿交付。v1 不自动重建混合数学字体和上下标。纯公式、数字、参考文献条目保留理由会列在报告。
+带英文解释的公式段不能因为难排而直接保留并宣称译完。标注疑难，必要时以原块保留的草稿交付。本版仍不自动重建复杂混合数学字体；普通注号上标和强调格式见 [样式说明](styles-media.md)。纯公式、数字、参考文献条目保留理由会列在报告。
 
 ## 疑难与裁决
 
@@ -101,7 +101,7 @@ python <tool> decide <job> query-p0001-b0003-001 --note "用户选择对照组�
 python <tool> figure <job> p0001-fig001 --source "Accuracy; Epoch" --translation "准确率；训练轮次" --note "核对了轴标签；数据和刻度原样保留。"
 ```
 
-确认无文字时，只传 `--note`。译文收录到报告，v1 不修改位图内部。该操作必须建立在实际查看图片的基础上。
+确认无文字时，只传 `--note`。该操作记录整图核验，并非 OCR 翻译本身；可提取图中文字与经核对的 OCR 区域会写入译文，复杂背景保持源图并记录未完成区域。具体命令见 [图片与附件](styles-media.md)。
 
 ## 输出和验收
 
@@ -111,7 +111,7 @@ python <tool> verify <job>
 python <tool> preview <job> --which bilingual --dpi 150
 ```
 
-默认字号下限 8 pt，可用 `--min-font` 明确调整（允许 6–24 pt），不得为消除警报而降低可读性。默认嵌入自带 CJK 字体，无系统中文字体依赖；可通过 `--font` 指定 TTF/OTF/TTC。中文字体通常无法与原英文完全相同，字号、颜色、位置优先保留，复杂样式需要视觉检查。
+默认字号下限 8 pt，可用 `--min-font` 明确调整（允许 6–24 pt）。原图标签或表格本来更小时沿用原字号，不强行放大；不得为消除警报进一步缩小到不可读。默认嵌入自带 CJK 字体，无系统中文字体依赖；可通过 `--font` 指定 TTF/OTF/TTC。强调格式按语义保留，复杂样式需要视觉检查。
 
 - `output/translated.pdf`、`output/bilingual.pdf`：无自动阻塞项的候选成品；视觉检查前状态为 `needs_visual_review`。
 - 有阻塞项时改为 `translated.draft.pdf`、`bilingual.draft.pdf`；`--strict` 返回 2。未成功排版的区域保留原内容，完整译文进入报告，不能据此宣称整页已翻译。
@@ -119,7 +119,7 @@ python <tool> preview <job> --which bilingual --dpi 150
 - `output/report.md`：疑问、裁决、术语、保留原因、位图文字和未排译文。
 - `document.json`、`translations.json`、`decisions.json`、`figures.json`：续跑及审计数据。
 
-输出路径以最新 `qa.json` 为准，旧草稿/候选成品不代表当前状态。自动 verify 校验输出哈希、页数、块译文回提取、起点误差（0.75 pt 容限）和双语左侧原页像素一致性（72 DPI）。这不代替语义和视觉审阅。
+输出路径以最新 `qa.json` 为准，旧草稿/候选成品不代表当前状态。自动 verify 校验输出哈希、页数、块译文回提取、起点误差（0.75 pt 容限）和双语左侧原页渲染（72 DPI）。仅容许不超过 0.001% RGB 通道、每通道不超过 2/255 的抗锯齿差异，并记录是否逐像素一致；不能将容差通过称为完全一致。这不代替语义和视觉审阅。
 
 实际检查源页和译文/双语预览后：
 
@@ -129,12 +129,12 @@ python <tool> verify <job> --visual-reviewed --note "已查看全部 N 页，复
 
 只有真实检查后才能标记；如果只检查部分页面，不能声称全文核验。内容、裁决、图片说明或输出文件变更后需重新 render 和 verify。
 
-## v1 接入选择与边界
+## 接入选择与边界
 
 本版选择最小的坐标控制流程，直接使用 PyMuPDF（固定 1.26.7）进行文字提取、文字层替换、嵌入 CJK 字体及页面合成，翻译通过当前会话导入。这也是“调用原有功能”：复用 PDF 库，自己实现术语、裁决和对齐。
 
-之前规划中的 PDFMathTranslate-next/BabelDOC 是候选，不是必须安装的依赖；未将未验证的内部接口纳入 v1。未来可增加适配器，继续遵循相同块编号、裁决与验收协议。
+之前规划中的 PDFMathTranslate-next/BabelDOC 是候选，不是必须安装的依赖；未采用其内部接口。未来可增加适配器，继续遵循相同块编号、裁决与验收协议。
 
-源文字块的几何分组、双栏排序和数学识别具有局限。复杂表格、跨栏混排、混合数学、字符轮廓化、扫描件、非英文、特殊背景、表单及签名文档均需额外审阅或后续实现。保留矢量线条和图片并不等于理解其内容。位图文字仅提供报告中的补充翻译。
+源文字块的几何分组、双栏排序和数学识别具有局限。复杂表格、跨栏混排、混合数学、字符轮廓化、非英文、特殊背景、表单及签名文档均需额外审阅。扫描页和位图可用本地 OCR，但识别结果、字体及覆盖区域须人工核对。保留矢量线条和图片并不等于理解其内容。
 
 官方依据：[PyMuPDF 页面 API](https://pymupdf.readthedocs.io/en/latest/page.html)、[文字 API 示例](https://pymupdf.readthedocs.io/en/latest/recipes-text.html)、[字体 API](https://pymupdf.readthedocs.io/en/latest/font.html)。能力以本项目固定版本实际验证结果为准。
