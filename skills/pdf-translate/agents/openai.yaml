@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF 英译中与双语对照"
+  short_description: "保留 PDF 版式，生成内容块对齐的英中对照，附专名原文与疑难裁决报告"
+  default_prompt: "使用 $pdf-translate 翻译这份英文 PDF，保留原版式，生成左英文右中文的内容块对齐文档，并列出需要裁决的疑问。"

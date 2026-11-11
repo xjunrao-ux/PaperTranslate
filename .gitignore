@@ -1,0 +1,11 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+output/
+tmp/
+jobs/
+dist/
+.env
+.env.*
+!.env.example
