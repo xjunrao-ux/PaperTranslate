@@ -22,11 +22,20 @@ try:
     import pymupdf as fitz
     import typography
     import media
+    import font_policy
+    import deliverables
+    import paragraph_layout
+    import paired_layout
+    import reviewed_regions
+    import content
+    import workflow
+    import audit
+    import profiles
 except ImportError:
     fitz = None
 
 VERSION = 1
-ENGINE_VERSION = '2.0.0'
+ENGINE_VERSION = '2.5.0'
 TOKEN = re.compile(r"⟦T\d{4}⟧")
 NUMBER = re.compile(r"(?<![\w])[-+−]?\d+(?:[.,]\d+)*(?:[eE][-+]?\d+)?")
 HAN = re.compile(r"[\u3400-\u9fff]")
@@ -80,11 +89,19 @@ def state(job):
 
 
 def input_hash(block):
-    return digest({k: block[k] for k in ("source", "prompt_text", "terms")})
+    value={k:block[k] for k in ('source','prompt_text','terms')}
+    if block.get('semantic'):
+        value['markup'],value['anchors']=content.markup(block)
+        value['math']=block.get('protected_math',[])
+    return digest(value)
+
+
+def implementation_hash():
+    return digest([(p.name,file_hash(p)) for p in sorted(Path(__file__).parent.glob('*.py'))])
 
 
 def revision(job, doc, translations):
-    return digest([ENGINE_VERSION,doc, translations, read_json(job / "decisions.json"),
+    return digest([ENGINE_VERSION,implementation_hash(),doc, translations, read_json(job / "decisions.json"),
                    read_json(job / "figures.json"),
                    attachment_state(job)])
 
@@ -138,8 +155,24 @@ def reading_order(items, width):
     return result
 
 
-def extract_page(page, number):
+def source_faces(page):
+    result={}
+    for resource in page.get_fonts():
+        name=re.sub(r'^[A-Z]{6}\+','',resource[3])
+        try:
+            face=page.parent.extract_font(resource[0])
+            if face[3]:
+                font=fitz.Font(fontbuffer=face[3])
+                result[name]=dict(bold=font.is_bold,italic=font.is_italic,serif=font.is_serif,monospace=font.is_monospaced)
+        except (ValueError,RuntimeError):
+            pass
+    return result
+
+
+def extract_page(page, number, semantic=False):
     items = []
+    faces=source_faces(page)
+    drawings=page.get_drawings() if semantic else []
     try:
         cells = [fitz.Rect(cell) for table in page.find_tables().tables for cell in table.cells if cell]
     except (ValueError, RuntimeError):
@@ -153,7 +186,8 @@ def extract_page(page, number):
         separate = any(abs(a["bbox"][1] - b["bbox"][1]) < 3 and
                        a["bbox"][2] + 3 < b["bbox"][0]
                        for a in lines for b in lines if a is not b)
-        for group in ([ [line] for line in lines ] if separate else [lines]):
+        groups=content.groups(lines,cells) if semantic else ([[line] for line in lines] if separate else [lines])
+        for group in groups:
             spans = [s for line in group for s in line["spans"] if s["text"].strip()]
             text = line_text(group)
             if not spans or not text:
@@ -166,7 +200,8 @@ def extract_page(page, number):
                        s['text'].strip() not in ('•','·','–','—') for s in spans) or bool(re.search(r"[=∑∫√≤≥≈∂∇]", text))
             automatic_keep = not bool(re.search(r"[A-Za-z]", text))
             kind = "math" if math else "rotated" if rotated else "text"
-            enclosing = [cell for cell in cells if (cell + (-1, -1, 1, 1)).contains(box)]
+            enclosing = [cell for cell in cells if (cell + (-1, -1, 1, 1)).contains(box) or
+                         all(s.get('origin') and cell.contains(fitz.Point(s['origin'])) for s in spans)]
             cell = min(enclosing, key=lambda r: r.get_area()) if enclosing else None
             if cell is not None and kind == "text":
                 kind = "table_cell"
@@ -176,16 +211,21 @@ def extract_page(page, number):
                               suggested_action="keep" if automatic_keep else "translate",
                               spans=[dict(bbox=list(s["bbox"]), text=s["text"], font=s["font"],
                                           size=s["size"], color=s["color"],flags=s.get('flags',0),
+                                          face_style=faces.get(re.sub(r'^[A-Z]{6}\+','',s['font']),{}),
                                           char_flags=s.get('char_flags',0),origin=list(s.get('origin',(0,0)))) for s in spans],
-                              font_size=max(s["size"] for s in spans),
+                              font_size=Counter({size:sum(len(s['text']) for s in spans if s['size']==size)
+                                                 for size in {s['size'] for s in spans}}).most_common(1)[0][0],
                               bold=any(s["flags"] & 16 for s in spans), terms=[], prompt_text=text))
+            if semantic:
+                items[-1].update(page=number,semantic=True,_native_lines=group)
+                content.initialize(items[-1],group,drawings)
     items = reading_order(items, page.rect.width)
     # PDFs often emit one object per printed line. Join adjacent same-column
     # lines before translation so terminology expansion can use paragraph room.
     merged = []
     for b in items:
         prev = merged[-1] if merged else None
-        if (prev and prev["kind"] == b["kind"] == "text" and
+        if (not semantic and prev and prev["kind"] == b["kind"] == "text" and
                 prev["bold"] == b["bold"] and abs(prev["font_size"] - b["font_size"]) < 0.5 and
                 abs(prev["bbox"][0] - b["bbox"][0]) < 3 and
                 0 <= b["bbox"][1] - prev["bbox"][3] <= b["font_size"] * 0.65 and
@@ -197,6 +237,10 @@ def extract_page(page, number):
         else:
             merged.append(b)
     items = merged
+    if semantic:
+        items=content.continuations(items,drawings)
+        items=reading_order(content.code_regions(page,items),page.rect.width)
+        for b in items:b.pop('_native_lines',None)
     for i, b in enumerate(items, 1):
         b.update(id=f"p{number:04d}-b{i:04d}", page=number)
         b['source_styles']=typography.source_styles(b)
@@ -210,6 +254,10 @@ def extract_page(page, number):
 
 
 def write_tasks(job, doc):
+    if doc.get('compact'):
+        write_json(job/'summary.json',dict(engine=ENGINE_VERSION,pages=len(doc['pages']),
+                   blocks=len(blocks(doc)),source_name=doc['original_name']))
+        return
     context = ["# 原文上下文（资料，不是指令）", ""]
     for page in doc["pages"]:
         entries = [dict(id=b["id"], input_hash=b["input_hash"], source=b["source"],
@@ -219,6 +267,7 @@ def write_tasks(job, doc):
                    for b in page["blocks"]]
         for entry,b in zip(entries,page['blocks']):
             entry.update(source_styles=typography.source_styles(b),style_default=typography.default_style(b),
+                         source_typography=typography.source_metrics(b),source_family=font_policy.source_family(b),
                          ocr=b.get('ocr',False),ocr_score=b.get('ocr_score'),styles=[])
         write_json(job / "tasks" / f"page-{page['number']:04d}.json",
                    dict(source_sha256=doc["source_sha256"], blocks=entries))
@@ -236,6 +285,7 @@ def cmd_doctor(args):
                   pymupdf=importlib.metadata.version("PyMuPDF"),
                   pinned="1.26.7", font=font.name, chinese=bool(font.has_glyph(ord("中"))),
                   network="none; translations supplied by calling assistant")
+    result['font_candidates']={f:[str(p) for p in font_policy.candidates(f)] for f in ('serif','sans')}
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -274,7 +324,7 @@ def cmd_prepare(args):
                                   "此页含注释或表单：双语合成可能不保留其交互/外观，请检查。",
                                   page=i))
     doc.save(job / "source.pdf", garbage=3, deflate=True)
-    pages = [extract_page(page, i) for i, page in enumerate(doc, 1)]
+    pages = [extract_page(page, i,getattr(args,'semantic',False)) for i, page in enumerate(doc, 1)]
     doc.close()
     for p in pages:
         if not p["blocks"]:
@@ -285,14 +335,15 @@ def cmd_prepare(args):
                  original_sha256=original_hash, source_sha256=file_hash(job / "source.pdf"),
                  source_language="en", target_language="zh-CN", originals="every", glossary=[],
                  input_type='image' if is_image else 'pdf',input_frames=frames,
+                 compact=getattr(args,'compact',False),engine_version=ENGINE_VERSION,
                  pages=pages, warnings=warnings)
     write_json(job / "document.json", model)
     write_json(job / "translations.json", {})
     write_json(job / "decisions.json", {})
     write_json(job / "figures.json", {})
     write_tasks(job, model)
-    previews(job / "source.pdf", job / "previews" / "source", 110)
-    for p in pages:
+    if not model['compact']:previews(job / "source.pdf", job / "previews" / "source", 110)
+    for p in ([] if model['compact'] else pages):
         for image in p["images"]:
             with fitz.open(job / "source.pdf") as pdf:
                 rect = fitz.Rect(image["bbox"]) & pdf[p["number"] - 1].rect
@@ -372,10 +423,21 @@ def validate_entry(b, entry):
     if not isinstance(text, str) or not text.strip():
         raise ValueError(f"{b['id']}: 译文为空")
     typography.validate_styles(entry)
+    marks=r'[†‡※★☆①-⑳✓✔✗✘→←↔⇒⇔]'
+    required_marks=Counter(re.findall(marks,b['source']))
+    for obj in b.get('protected_math',[]):required_marks-=Counter(re.findall(marks,obj['source']))
+    if required_marks!=Counter(re.findall(marks,text)):
+        raise ValueError('特殊标记须与原文逐一保留，不能遗漏或改作普通项目符号')
+    if b.get('protected_math') and Counter(content.MTOKEN.findall(text))!=Counter(o['token'] for o in b['protected_math']):
+        raise ValueError(f"{b['id']}: 公式占位符须完整保留，禁止改写为普通文字")
+    if entry.get('anchor_protocol'):
+        _,anchors=content.markup(b)
+        if [s.get('source_anchor') for s in entry.get('styles',[])]!=[a['id'] for a in anchors]:
+            raise ValueError('格式锚点必须与源片段逐一对应')
     if b.get('ocr') and entry.get('ocr_reviewed') is not True:
         raise ValueError(f"{b['id']}: OCR 文字与覆盖区域须人工核对后设置 ocr_reviewed=true")
     expected = Counter(t["token"] for t in b["terms"])
-    if Counter(TOKEN.findall(text)) != expected or re.search(r"⟦(?!T\d{4}⟧)", text):
+    if Counter(TOKEN.findall(text)) != expected or re.search(r"⟦(?!(?:T|M)\d{4}⟧)", text):
         raise ValueError(f"{b['id']}: 每个术语占位符必须恰好保留一次，且不能新增占位符")
 
 
@@ -396,7 +458,7 @@ def cmd_import(args):
     # Validate the complete response before changing stored state.
     for entry in response["blocks"]:
         translations[entry["id"]] = {k: v for k, v in entry.items()
-                                      if k in ("input_hash", "text", "action", "reason", "issues",'styles','ocr_reviewed')}
+                                      if k in ("input_hash", "text", "action", "reason", "issues",'styles','ocr_reviewed','anchor_protocol','keep_kind')}
     write_json(job / "translations.json", translations)
     print(f"已导入 {len(seen)} 块，保留其他已完成译文。")
 
@@ -407,6 +469,7 @@ def expanded(b, entry, numbers=False):
         replacement = t["source"] if numbers else t["target"] + (
             f"（{t['source']}）" if t["original"] else "")
         text = text.replace(t["token"], replacement)
+    for obj in b.get('protected_math',[]):text=text.replace(obj['token'],obj['source'])
     return text
 
 
@@ -419,7 +482,9 @@ def wrap_text(text, width, font, size):
     if width <= 0:
         return None
     closing = re.escape("，。、；：？！）》】」』”’％%,.;:!?)]}")
-    raw = re.findall(r"\n|[^\S\n]+|[A-Za-z0-9]+(?:[._:/+\-][A-Za-z0-9]+)*[" +
+    scientific=r'[+−-]?\d+(?:\.\d+)?\s*[×x]\s*10[−-]\d+'
+    measure=r'[+−-]?\d+(?:[.,]\d+)*(?:[eE][+−-]?\d+)?[ \u00a0]?(?:°C|GHz|MHz|kHz|GHz|kPa|MPa|GPa|MiB|GiB|KB|MB|GB|mm|cm|km|nm|µm|μm|ns|ms|µs|μs|kg|mL|mol|Hz|W|V|A|K|s|m|g|%|％|℃|年|月|日|次)(?![A-Za-z])'
+    raw = re.findall(r"\n|"+scientific+r"["+closing+r"]*|"+measure+r"["+closing+r"]*|[^\S\n]+|[A-Za-z0-9]+(?:[._:/+\-][A-Za-z0-9]+)*[" +
                      closing + r"]*|.[" + closing + r"]*", text)
     units, opening = [], ""
     for unit in raw:
@@ -446,6 +511,8 @@ def wrap_text(text, width, font, size):
             line = ""
         if unit.isspace():
             continue
+        if re.fullmatch('(?:'+measure+'|'+scientific+')'+r'['+closing+r']*',unit) and font.text_length(unit,fontsize=size)>width+.01:
+            return None  # Do not split a number from its unit just to claim a fit.
         for char in re.findall(r".[" + closing + r"]*", unit):
             if font.text_length(char, fontsize=size) > width + 0.01:
                 return None
@@ -455,15 +522,38 @@ def wrap_text(text, width, font, size):
             line += char
     if line or not lines:
         lines.append(line.rstrip())
+    # Avoid a lone final Han character plus punctuation when the previous line
+    # can lend one character without stranding an opening bracket or a unit.
+    han=r'[\u3400-\u9fff]'
+    if '\n' not in text and len(lines)>1 and re.fullmatch(han+r'['+closing+r']*',lines[-1]) and re.search(han+r'$',lines[-2]):
+        previous,last=lines[-2],lines[-1]
+        proposed=previous[-1]+last
+        if len(previous)>1 and previous[-2] not in '（《【「『“‘([{' and not (
+                previous[-1] in '年月日次' and previous[-2].isdigit()) and font.text_length(proposed,fontsize=size)<=width+.01:
+            lines[-2],lines[-1]=previous[:-1],proposed
     return lines
 
 
 def available_rect(b, page, drawings):
-    rect = fitz.Rect(b["bbox"])
-    if b.get("cell_bbox"):
-        cell = fitz.Rect(b["cell_bbox"])
-        rect.x1 = cell.x1 - max(3, min(12, rect.x0 - cell.x0))
-        rect.y1 = max(rect.y1, cell.y1 - 2)
+    rect = fitz.Rect(b.get('layout_bbox',b['bbox']))
+    enclosing=[r for r in drawings if r.height <= b['font_size']*12 and r.width>0 and r.height>0 and
+               all(s.get('origin') and r.contains(fitz.Point(s['origin'])) for s in b['spans'])]
+    boundary=fitz.Rect(b['cell_bbox']) if b.get('cell_bbox') else min(enclosing,key=lambda r:r.get_area()) if enclosing else None
+    if boundary is not None:
+        cell = boundary
+        pad = min(.5, b['font_size']*.04)
+        rect.x0,rect.y0 = max(rect.x0,cell.x0+pad),max(rect.y0,cell.y0+pad)
+        rect.x1,rect.y1 = cell.x1-pad,cell.y1-pad
+        # A large callout can contain several labels: its full frame is not
+        # permission to overwrite another label or a nested node.
+        for other in page['blocks']:
+            if other['id']==b['id']:continue
+            obstacle=fitz.Rect(other['bbox'])
+            if not obstacle.intersects(cell):continue
+            if obstacle.x0<rect.x1 and obstacle.x1>rect.x0 and obstacle.y0>rect.y0:
+                rect.y1=min(rect.y1,obstacle.y0-.2)
+            elif obstacle.y0<rect.y1 and obstacle.y1>rect.y0 and obstacle.x0>rect.x0:
+                rect.x1=min(rect.x1,obstacle.x0-.2)
         return rect
     bottom = page["height"] - 8
     obstacles = [fitz.Rect(o["bbox"]) for o in page["blocks"] if o["id"] != b["id"]]
@@ -472,21 +562,37 @@ def available_rect(b, page, drawings):
     for other in obstacles:
         overlap_x = min(rect.x1, other.x1) - max(rect.x0, other.x0)
         if overlap_x > 0.5 and other.y0 >= rect.y1 - 0.5:
-            bottom = min(bottom, other.y0 - 2)
+            bottom = min(bottom, other.y0 - .25)
     rect.y1 = max(rect.y1, bottom)
     return rect
 
 
+def redaction_rect(span, block):
+    # PDF font envelopes can overlap in dense rows even when the printed ink does
+    # not. Text redaction removes a whole intersecting character: a central band
+    # deletes this span without sweeping over an adjacent row's font envelope.
+    r=fitz.Rect(span['bbox'])
+    if block.get('rotation')==90:
+        middle=(r.x0+r.x1)/2
+        r.x0,r.x1=middle-.1,middle+.1
+        r.y0+=.1;r.y1-=.1
+    else:
+        middle=(r.y0+r.y1)/2
+        r.y0,r.y1=middle-.1,middle+.1
+        r.x0+=.1;r.x1-=.1
+    return r
+
+
 def layout(text, rect, b, font, min_size):
-    start = max(min_size, min(b["font_size"], 24))
-    size = start
-    while size >= min_size - 0.01:
+    for size in typography.sizes(b['font_size'], min_size):
         lines = wrap_text(text, rect.width, font, size)
-        line_height = max(font.ascender - font.descender, 1.25) * size
-        if lines and len(lines) * line_height <= rect.height + 0.01:
+        glyph_height = (font.ascender - font.descender)*size
+        source_leading=typography.source_metrics(b)['line_height']
+        line_height = max(glyph_height, source_leading*size/b['font_size'] if source_leading else size*1.2)
+        height = glyph_height+(len(lines)-1)*line_height if lines else float('inf')
+        if lines and height <= rect.height + 0.01:
             return dict(lines=lines, size=round(size, 3), line_height=line_height,
-                        rect=[rect.x0, rect.y0, rect.x1, rect.y0 + len(lines) * line_height])
-        size = round(size - 0.25, 3)
+                        rect=[rect.x0, rect.y0, rect.x1, rect.y0 + height])
     return None
 
 
@@ -513,6 +619,7 @@ def collect_issues(job, doc, translations):
                 issues.append(issue(image["id"], "位图区域尚未核对英文标签；请查看区域预览。",
                                     page=page["number"]))
         for b in page["blocks"]:
+            if b['id'] in reviewed_regions.covered(doc):continue
             entry = translations.get(b["id"])
             if not entry:
                 issues.append(issue("missing-" + b["id"], "尚无译文/保留决定", b["id"], b["page"]))
@@ -521,10 +628,17 @@ def collect_issues(job, doc, translations):
                 issues.append(issue("stale-" + b["id"], "术语或输入已变化，译文需要重新导入。", b["id"], b["page"]))
                 continue
             validate_entry(b, entry)
+            if b.get('role')=='code' and not entry.get('annotation'):
+                issues.append(issue('annotation-'+b['id'],'原生算法代码已保留，需要中文注释说明；运行 next。',b['id'],b['page']))
+            if entry.get('action')=='keep' and re.search(
+                    r'放不下|字号|字体太大|溢出|空间不足|排不下|过小|太小|font.{0,20}(?:big|small)|overflow|does not fit|too small',
+                    entry.get('reason',''),re.I):
+                issues.append(issue('untranslated-'+b['id'],
+                                    '因排版困难保留英文，仍属未完成翻译；须调整排版，不能作为合理 keep。',b['id'],b['page']))
             if entry.get("action", "translate") == "translate":
-                if typography.mixed_styles(b) and not entry.get('styles'):
+                if not entry.get('anchor_protocol') and typography.mixed_styles(b) and not entry.get('styles'):
                     issues.append(issue('format-'+b['id'],'原文含段内混合格式，需要为对应译文提供 styles 语义范围。',b['id'],b['page']))
-                elif any(any(s['style'][k] for s in typography.source_styles(b)) and
+                elif not entry.get('anchor_protocol') and any(any(s['style'][k] for s in typography.source_styles(b)) and
                          not any(s[k] for s in typography.styled_text(b,entry)[1])
                          for k in typography.KEYS):
                     issues.append(issue('format-'+b['id'],'译文格式遗漏了原文的强调属性，请核对对应 styles。',b['id'],b['page']))
@@ -556,9 +670,10 @@ def previews(pdf, directory, dpi):
 
 
 def write_report(job, doc, translations, qa):
+    if doc.get('compact'):return audit.report(job,doc,translations,qa)
     lines = ["# 翻译审阅报告", "", f"状态：{qa['status']}",
              f"源文档：{doc['original_name']}",
-             f"更新时间（UTC）：{now()}",
+             f"更新时间（UTC）：{qa.get('visual_review',{}).get('time',qa.get('generated',doc['created']))}",
              "", "## 输出", ""]
     for name in ("translated", "bilingual"):
         if qa.get(name):
@@ -577,7 +692,15 @@ def write_report(job, doc, translations, qa):
             lines.append("建议：" + q["recommendation"])
         if q.get("decision"):
             lines.append("裁决：" + q["decision"]["note"])
+        if q.get('details'):
+            lines.append('排版测量：'+json.dumps(q['details'],ensure_ascii=False))
         lines.append("")
+    lines+=['## 字体与对齐策略','',
+            '对齐模式：'+qa.get('alignment','position')+'。段落重排会在较短一侧增加留白并重新分页；原坐标模式不改变原文侧页面。']
+    fonts={json.dumps({k:r[k] for k in ('source_family','target_family','font','sha256','selection','family_match')},ensure_ascii=False,sort_keys=True)
+           for r in qa.get('font_policy',{}).values()}
+    lines += ['- '+f for f in sorted(fonts)]
+    lines+=['','各块的原字号、目标字号、源基线间距及使用的行距见 qa.json 的 layouts；有字体类别降级时需检查实际页面。','']
     lines += ["## 术语表", ""]
     lines += [f"- {t['source']} → {t['target']}（{t.get('kind', 'term')}）" for t in doc["glossary"]]
     lines += ["", "## 保留原文的内容", ""]
@@ -605,16 +728,33 @@ def write_report(job, doc, translations, qa):
 
 def cmd_render(args):
     require_pdf()
+    if getattr(args,'alignment','position')=='paired':
+        return paired_layout.render(argparse.Namespace(**globals()),args)
+    if getattr(args,'alignment','position')=='paragraph':
+        return paragraph_layout.render(argparse.Namespace(**globals()),args)
     if not 6 <= args.min_font <= 24:
         raise ValueError("最小字号须在 6 到 24 pt 之间；默认 8 pt")
     job, doc, translations = state(args.job)
-    font = font_for(args)
+    profiles.ready(doc)
+    args=profiles.arguments(args,doc)
+    max_shrink=getattr(args,'max_shrink',.10)
+    if not 0 <= max_shrink <= .5: raise ValueError('--max-shrink 须在 0–0.5 之间，默认最多缩小 10%')
+    resolver = font_policy.Resolver(args)
+    block_fonts = {}
     issues = collect_issues(job, doc, translations)
     layouts, kept = {}, 0
-    translated = fitz.open(job / "source.pdf")
-    for model, page in zip(doc["pages"], translated):
+    translated = fitz.open()
+    native_source=fitz.open(job/'source.pdf')
+    for model, source_page in zip(doc["pages"], native_source):
+        # Redaction and TextWriter both mutate resources. Isolate each source
+        # page so shared font dictionaries cannot become another page's stream.
+        work=fitz.open()
+        work.insert_pdf(native_source,from_page=source_page.number,to_page=source_page.number)
+        page=work[0]
         drawings = [fitz.Rect(d["rect"]) for d in page.get_drawings()]
         for b in model["blocks"]:
+            if getattr(args,'_include_blocks',None) is not None and b['id'] not in args._include_blocks:continue
+            b=profiles.render_block(b,doc)
             entry = translations.get(b["id"], {})
             if entry.get("input_hash") != b["input_hash"]:
                 continue
@@ -629,14 +769,25 @@ def cmd_render(args):
                                     "混合数学/旋转内容需要人工处理；保留原区域以防损坏。",
                                     b["id"], b["page"]))
                 continue
+            font,font_record = resolver.for_block(b)
+            block_fonts[b['id']]=font
+            if not font_record['family_match']:
+                issues.append(issue('font-family-'+b['id'],
+                                    '字体类别需核对：'+font_record['source_family']+' → '+font_record['font']+
+                                    '；可用 --font-serif/--font-sans 显式指定。',b['id'],b['page'],severity='minor'))
             target,character_styles = typography.styled_text(b,entry)
-            missing = sorted({c for c in target if not c.isspace() and not font.has_glyph(ord(c))})
+            if b.get('profile_bold'):
+                for s in character_styles:s['bold']=True
+            missing = sorted({c for c in target if not c.isspace() and not 0xe000<=ord(c)<0xf000 and not font.has_glyph(ord(c))})
+            if any(not o.get('safe',True) for o in b.get('protected_math',[])):
+                issues.append(issue('math-region-'+b['id'],'公式区域与其他文字重叠，需核对公式边界。',b['id'],b['page']))
+                continue
             if missing:
                 issues.append(issue("glyph-" + b["id"], f"字体缺少字符：{''.join(missing)}；可指定 --font。",
                                     b["id"], b["page"]))
                 continue
             # Do not redact through any other block's characters.
-            collision = any(fitz.Rect(s["bbox"]).intersects(fitz.Rect(t["bbox"]))
+            collision = any(redaction_rect(s,b).intersects(fitz.Rect(t["bbox"]))
                             for other in model["blocks"] if other["id"] != b["id"]
                             for s in b["spans"] for t in other["spans"])
             if collision:
@@ -647,16 +798,25 @@ def cmd_render(args):
             original_rect=fitz.Rect(b['bbox'])
             rect = original_rect if b.get('ocr') else available_rect(b, model, drawings)
             if rotated: rect=fitz.Rect(3,3,3+original_rect.height,3+original_rect.width)
-            floor=min(args.min_font,b['font_size'])
-            formatted=rotated or any(any(s.values()) for s in character_styles)
-            plan = (typography.rich_layout(target,character_styles,rect,b,font,floor,wrap_text)
-                    if formatted else layout(target, rect, b, font, floor))
+            floor=max(min(args.min_font,b['font_size']),b['font_size']*(1-max_shrink))
+            plan = typography.rich_layout(target,character_styles,rect,b,font,floor,wrap_text)
             if plan is None:
-                issues.append(issue("overflow-" + b["id"], "译文在字号下限内放不下；保留原区域，完整译文见报告。",
-                                    b["id"], b["page"]))
+                issues.append(issue("overflow-" + b["id"],
+                                    '译文实际测量超出可用区域，尚未完成；先核对单元格/标签边界与字体，再做局部重排。完整译文见报告。',
+                                    b["id"], b["page"], details=dict(source_font_size=b['font_size'],
+                                    minimum_font_size=floor,font=font.name,available_rect=list(rect),
+                                    width_pt=rect.width,height_pt=rect.height,source_typography=typography.source_metrics(b))))
                 continue
             plan.update(block_id=b["id"], page=b["page"], source_bbox=b["bbox"], target=target,
-                        anchor_error_pt=0.0,style_default=typography.default_style(b))
+                        expected_anchor=list(original_rect.tl if rotated else rect.tl),
+                        anchor_adjustment_pt=0 if rotated else round(rect.y0-original_rect.y0,4),
+                        anchor_error_pt=0.0,style_default=typography.default_style(b),font_policy=font_record,
+                        size_ratio=round(plan['size']/b['font_size'],4))
+            plan.update(style_role=b.get('style_role'),article_font_size=b['font_size'])
+            if b.get('protected_math'):
+                try:plan['math_backgrounds']={o['token']:content.background(native_source[b['page']-1],o['bbox']) for o in b['protected_math']}
+                except ValueError as exc:
+                    issues.append(issue('math-region-'+b['id'],str(exc),b['id'],b['page']));continue
             if rotated:
                 plan.update(rotation=90,rotation_bounds=list(original_rect))
             if b.get('ocr'):
@@ -675,28 +835,37 @@ def cmd_render(args):
             if b["id"] in layouts:
                 if b.get('ocr'): continue
                 for span in b["spans"]:
-                    r = fitz.Rect(span["bbox"])
-                    page.add_redact_annot(r + (0.1, 0.1, -0.1, -0.1), fill=False, cross_out=False)
+                    page.add_redact_annot(redaction_rect(span,b), fill=False, cross_out=False)
         page.apply_redactions(images=0, graphics=0, text=0)
         for b in model["blocks"]:
             plan = layouts.get(b["id"])
             if not plan:
                 continue
+            font=block_fonts[b['id']]
             if b.get('ocr'):
                 page.draw_rect(fitz.Rect(b['bbox'])+(-.3,-.3,.3,.3),color=None,fill=plan['erase_background'],overlay=True)
+            for obj in b.get('protected_math',[]):
+                page.draw_rect(fitz.Rect(obj['bbox']),color=None,fill=plan['math_backgrounds'][obj['token']],overlay=True)
             x0, y0, x1, y1 = plan["rect"]
             color_int = b["spans"][0]["color"]
             color = tuple(((color_int >> shift) & 255) / 255 for shift in (16, 8, 0))
             if b.get('ocr'):color=plan['ocr_foreground']
             if plan.get('rotation')==90:
-                typography.draw_rotated(page,plan,font,color)
+                typography.draw_rotated(page,plan,font,color,native_source)
             elif 'segments' in plan:
-                typography.draw(page,plan,font,color)
+                typography.draw(page,plan,font,color,native_source)
             else:
                 writer = fitz.TextWriter(page.rect)
                 for i,line in enumerate(plan['lines']):
                     writer.append((x0,y0+font.ascender*plan['size']+i*plan['line_height']),line,font=font,fontsize=plan['size'])
                 writer.write_text(page,color=color)
+        audit.resources(work)
+        translated.insert_pdf(work)
+        work.close()
+    native_source.close()
+    if getattr(args,'_return_base',False):
+        return translated,issues,layouts,kept,resolver.records
+    if doc.get('compact'):issues.extend(audit.structure(doc,list(layouts.values()),'position'))
     blockers = [q for q in issues if q["severity"] == "major" and not q.get("resolved")]
     output = job / "output"
     output.mkdir(exist_ok=True)
@@ -704,7 +873,7 @@ def cmd_render(args):
     mono = output / f"translated{suffix}.pdf"
     dual = output / f"bilingual{suffix}.pdf"
     translated.set_metadata(dict(title=doc["original_name"] + " 中文译文" + (" DRAFT" if blockers else ""),
-                                 producer="pdf-translate v2 / PyMuPDF"))
+                                 producer="pdf-translate "+ENGINE_VERSION+" / PyMuPDF"))
     translated_attachments=[]
     if (job/'attachments.json').exists():
         for i,item in enumerate(read_json(job/'attachments.json'),1):
@@ -715,6 +884,7 @@ def cmd_render(args):
                 translated.embfile_add(name,path.read_bytes(),filename=name)
                 translated_attachments.append((name,path))
     translated.save(mono, garbage=4, deflate=True)
+    with fitz.open(mono) as saved:audit.resources(saved)
     bilingual, original = fitz.open(), fitz.open(job / "source.pdf")
     for i, page in enumerate(original):
         w, h, header, gap = page.rect.width, page.rect.height, 24, 12
@@ -725,23 +895,27 @@ def cmd_render(args):
         spread.insert_text((w + gap + 12, 16), "Chinese / translation" + (" - DRAFT" if blockers else ""),
                            fontsize=9, color=(0.25, 0.3, 0.4))
     bilingual.set_metadata(dict(title="English-Chinese" + (" DRAFT" if blockers else ""),
-                                producer="pdf-translate v2 / PyMuPDF"))
+                                producer="pdf-translate "+ENGINE_VERSION+" / PyMuPDF"))
     for name,path in translated_attachments:
         bilingual.embfile_add(name,path.read_bytes(),filename=name)
     bilingual.save(dual, garbage=4, deflate=True)
+    with fitz.open(dual) as saved:audit.resources(saved)
     bilingual.close()
     original.close()
     translated.close()
-    qa = dict(status="draft" if blockers else "needs_visual_review", revision=revision(job, doc, translations),
+    qa = dict(engine_version=ENGINE_VERSION,protocol_version=2,status="draft" if blockers else "needs_visual_review",alignment='position', revision=revision(job, doc, translations),
               source_sha256=doc["source_sha256"], translated=str(mono), bilingual=str(dual),
               output_hashes={str(p): file_hash(p) for p in (mono, dual)},
               issues=issues, blockers=blockers, layouts=list(layouts.values()),
               translated_blocks=len(layouts), kept_blocks=kept, total_blocks=len(blocks(doc)),
-              render_options=dict(min_font=args.min_font, font=args.font), generated=now())
+              render_options=dict(min_font=args.min_font, font=args.font,max_shrink=max_shrink),
+              font_policy=resolver.records,generated=now())
+    if doc.get('style_profile'):qa['style_profile']=doc['style_profile']
     write_json(output / "qa.json", qa)
     write_report(job, doc, translations, qa)
-    previews(mono, job / "previews" / "translated", args.dpi)
-    previews(dual, job / "previews" / "bilingual", args.dpi)
+    mode=getattr(args,'preview','all')
+    if mode=='all':previews(mono, job / 'previews/translated', args.dpi)
+    if mode!='none':previews(dual, job / 'previews/bilingual', args.dpi)
     if doc.get('input_type')=='image':
         qa['image_exports']=[]
         with fitz.open(mono) as images:
@@ -766,7 +940,7 @@ def cmd_decide(args):
     if args.issue not in available:
         raise ValueError("未知问题编号；仅可裁决语义/来源疑点，不能绕过排版错误。")
     q = available[args.issue]
-    if args.issue.startswith(("missing-", "stale-", "language-", "scan-",'format-','image-background-','attachment-')):
+    if args.issue.startswith(("missing-", "stale-", "language-", "scan-",'format-','image-background-','attachment-','untranslated-','annotation-','math-region-')):
         raise ValueError("此问题须修复内容或重新导入，不能仅靠裁决跳过。")
     clean = {k: v for k, v in q.items() if k not in ("resolved", "decision")}
     decisions = read_json(job / "decisions.json")
@@ -792,12 +966,24 @@ def cmd_verify(args):
     require_pdf()
     job, doc, translations = state(args.job)
     qa = read_json(job / "output" / "qa.json")
+    for key in ('translated','bilingual'):
+        with fitz.open(qa[key]) as saved:audit.resources(saved)
+    if doc.get('compact') and audit.structure(doc,qa['layouts'],qa.get('alignment','position')):
+        raise ValueError('结构验收失败：请修复标题边界、角色或区域冲突后重新构建')
     if qa["revision"] != revision(job, doc, translations):
         raise ValueError("输入或译文已变化，请重新 render")
     if any(file_hash(p) != h for p, h in qa["output_hashes"].items()):
         raise ValueError("输出文件已改变，请重新 render")
     if qa["blockers"]:
         raise ValueError("仍有阻塞项，请先查看 report.md 并修复")
+    if doc.get('compact'):
+        profiles.ready(doc)
+        if qa.get('engine_version')!=ENGINE_VERSION or qa.get('protocol_version')!=2:raise ValueError('最终输出未进入当前引擎协议，请重新 build')
+        for key in ('translated','bilingual'):
+            with fitz.open(qa[key]) as p:
+                if 'pdf-translate '+ENGINE_VERSION not in p.metadata.get('producer',''):raise ValueError('检测到未纳入引擎的后处理 PDF，请从任务重新 build')
+    if qa.get('alignment') in ('paragraph','paired'):
+        return paragraph_layout.verify(argparse.Namespace(**globals()),args,job,doc,translations,qa)
     checks,source_checks = [],[]
     with fitz.open(qa["translated"]) as mono, fitz.open(qa["bilingual"]) as dual, fitz.open(job / "source.pdf") as source:
         if len(mono) != len(source) or len(dual) != len(source):
@@ -819,15 +1005,16 @@ def cmd_verify(args):
                 actual = out.get_text("dict", clip=fitz.Rect(plan["rect"]) + (-0.5, -0.5, 0.5, 0.5))
                 spans = [s for block in actual["blocks"] if block.get("type") == 0
                          for line in block["lines"] for s in line["spans"]]
-                expected_text = "".join(plan["target"].split())
-                actual_text = "".join("".join(s["text"] for s in spans).split())
+                all_spans=spans
+                expected_text,actual_text,spans=content.ordinary_text(plan,out)
                 if expected_text not in actual_text:
                     raise ValueError(f"{plan['block_id']}: 写入后文字核对失败，请检查裁切或字体")
-                top = min(s["bbox"][1] for s in spans)
-                error = abs(top - plan["source_bbox"][1])
+                top = min(s["bbox"][1] for s in all_spans) if all_spans else plan['rect'][1]
+                error = abs(top - plan.get('expected_anchor',plan['source_bbox'][:2])[1])
                 if error > 0.75:
                     raise ValueError(f"{plan['block_id']}: 内容块起点误差 {error:.2f} pt")
                 checks.append(dict(block_id=plan["block_id"], actual_anchor_error_pt=round(error, 4), text_present=True))
+        qa['preserved_checks']=audit.preserved(doc,translations,mono,qa)
     qa["checks"] = checks
     qa['source_render_checks']=source_checks
     if args.visual_reviewed:
@@ -854,10 +1041,49 @@ def cmd_preview(args):
     print(str(job / "previews" / args.which))
 
 
+def cmd_export(args):
+    job,doc,translations=state(args.job)
+    qa=read_json(job/'output/qa.json')
+    if qa['revision']!=revision(job,doc,translations):
+        raise ValueError('任务已改变，请重新排版和核验，不能导出旧版输出')
+    if any(not Path(p).is_file() or file_hash(p)!=h for p,h in qa['output_hashes'].items()):
+        raise ValueError('输出哈希不匹配，请重新排版，不能导出旧版输出')
+    write_report(job,doc,translations,qa)
+    print(json.dumps(deliverables.export(job,doc,qa,args.directory,args.revision,args.name,args.draft),
+                     ensure_ascii=False,indent=2))
+
+
+def cmd_typography(args):
+    job,doc,_=state(args.job)
+    if doc.get('style_profile'):raise ValueError('本任务采用文章级样式；请 profile 调整角色格式，repair 修正语义强调或分类')
+    data=read_json(args.file)
+    index={b['id']:b for b in blocks(doc)}
+    updates={}
+    for entry in data.get('blocks',[]):
+        key=entry.get('id')
+        if key not in index or key in updates:raise ValueError('未知或重复内容块')
+        if not str(entry.get('reason','')).strip():raise ValueError('字体人工修正需记录视觉核对依据 reason')
+        if set(entry)-{'id','reason','font_family','font_size','line_height',*typography.KEYS}:raise ValueError('未知字体修正属性')
+        if entry.get('font_family','serif') not in ('serif','sans','mono'):raise ValueError('font_family 无效')
+        for k in ('font_size','line_height'):
+            if k in entry and (type(entry[k]) not in (int,float) or not 0 < entry[k] <= 512):raise ValueError('字号/行距须为 0–512 pt 内的正数')
+        if any(type(entry[k]) is not bool for k in typography.KEYS if k in entry):raise ValueError('样式修正须为布尔值')
+        updates[key]=entry
+    if not updates:raise ValueError('没有字体修正')
+    for key,entry in updates.items():
+        b=index[key]
+        b.setdefault('extracted_font_size',b['font_size'])
+        b.setdefault('typography_overrides',{}).update({k:v for k,v in entry.items() if k!='id'})
+        if 'font_size' in entry:b['font_size']=entry['font_size']
+    write_json(job/'document.json',doc);write_tasks(job,doc)
+    print(f'已记录 {len(updates)} 个视觉核对修正，保留原始元数据；需重新排版核验。')
+
+
 def cmd_refresh_styles(args):
     job,doc,_=state(args.job)
     with fitz.open(job/'source.pdf') as pdf:
         for model,page in zip(doc['pages'],pdf):
+            faces=source_faces(page)
             native=[]
             for raw in page.get_text('dict')['blocks']:
                 if raw.get('type')!=0: continue
@@ -871,6 +1097,7 @@ def cmd_refresh_styles(args):
                     if matches:
                         n,d=matches[0]
                         s.update(flags=n.get('flags',0),char_flags=n.get('char_flags',0),origin=list(n['origin']))
+                        s['face_style']=faces.get(re.sub(r'^[A-Z]{6}\+','',n['font']),{})
                         directions.append(d)
                 if directions and all(abs(d[0])<.01 and d[1]<-.9 for d in directions):
                     b['rotation']=90
@@ -958,8 +1185,14 @@ def parser():
     s.add_argument("job")
     s.add_argument("--min-font", type=float, default=8)
     s.add_argument("--font", help="可选 CJK TTF/OTF/TTC 字体路径")
+    s.add_argument('--font-serif',help='原文衬线字体对应的中文字体路径')
+    s.add_argument('--font-sans',help='原文无衬线字体对应的中文字体路径')
+    s.add_argument('--font-mono',help='原文等宽块对应的中文字体路径')
+    s.add_argument('--max-shrink',type=float,default=.10,help='相对原字号的最大缩小比例，默认 0.10')
+    s.add_argument('--alignment',choices=('position','paired','paragraph'),default='position',help='固定原页、保留栏目并补段后留白、自由单栏重排')
     s.add_argument("--dpi", type=int, default=110)
     s.add_argument("--strict", action="store_true")
+    s.add_argument('--preview',choices=('all','bilingual','none'),default='all')
     s.set_defaults(func=cmd_render)
     s = sub.add_parser("decide")
     s.add_argument("job")
@@ -984,6 +1217,14 @@ def parser():
     s.add_argument("--which", choices=("source", "translated", "bilingual"), default="bilingual")
     s.add_argument("--dpi", type=int, default=150)
     s.set_defaults(func=cmd_preview)
+    s=sub.add_parser('export')
+    s.add_argument('job');s.add_argument('--directory',required=True)
+    s.add_argument('--name',help='可选导出文档名，不含路径或扩展名')
+    s.add_argument('--revision',type=int,default=1)
+    s.add_argument('--draft',action='store_true',help='明确导出草稿，名称强制包含 draft')
+    s.set_defaults(func=cmd_export)
+    s=sub.add_parser('typography')
+    s.add_argument('job');s.add_argument('file');s.set_defaults(func=cmd_typography)
     s=sub.add_parser('refresh-styles')
     s.add_argument('job');s.set_defaults(func=cmd_refresh_styles)
     s=sub.add_parser('ocr')
@@ -996,6 +1237,7 @@ def parser():
     s=sub.add_parser('attachments')
     s.add_argument('job');s.add_argument('--prepare',action='store_true');s.add_argument('--ocr',action='store_true')
     s.set_defaults(func=cmd_attachments)
+    workflow.register(sub,argparse.Namespace(**globals()))
     return p
 
 

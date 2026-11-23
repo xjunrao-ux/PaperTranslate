@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 output/
+输出/
 tmp/
 jobs/
 dist/
